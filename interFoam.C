@@ -1,0 +1,256 @@
+/*---------------------------------------------------------------------------*\
+  =========                 |
+  \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox
+   \\    /   O peration     |
+    \\  /    A nd           | Copyright (C) 2011-2015 OpenFOAM Foundation
+     \\/     M anipulation  |
+-------------------------------------------------------------------------------
+License
+    This file is part of OpenFOAM.
+
+    OpenFOAM is free software: you can redistribute it and/or modify it
+    under the terms of the GNU General Public License as published by
+    the Free Software Foundation, either version 3 of the License, or
+    (at your option) any later version.
+
+    OpenFOAM is distributed in the hope that it will be useful, but WITHOUT
+    ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+    FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+    for more details.
+
+    You should have received a copy of the GNU General Public License
+    along with OpenFOAM.  If not, see <http://www.gnu.org/licenses/>.
+
+Application
+    interFoam
+Description
+    Solver for 2 incompressible, isothermal immiscible fluids using a VOF
+    (volume of fluid) phase-fraction based interface capturing approach.
+
+    The momentum and other fluid properties are of the "mixture" and a single
+    momentum equation is solved.
+
+    Turbulence modelling is generic, i.e. laminar, RAS or LES may be selected.
+
+    For a two-fluid approach see twoPhaseEulerFoam.
+
+\*---------------------------------------------------------------------------*/
+
+#include "fvCFD.H"
+#include "CMULES.H"
+#include "EulerDdtScheme.H"
+#include "localEulerDdtScheme.H"
+#include "CrankNicolsonDdtScheme.H"
+#include "subCycle.H"
+#include "immiscibleIncompressibleTwoPhaseMixture.H"
+#include "turbulenceModel.H"
+#include "pimpleControl.H"
+#include "fvIOoptionList.H"
+#include "fixedFluxPressureFvPatchScalarField.H"
+
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+
+
+Foam::tmp<Foam::surfaceScalarField> calculateSurfaceTensionForce(const volScalarField & alpha1, const immiscibleIncompressibleTwoPhaseMixture & mixture)
+{
+	const fvMesh& mesh = alpha1.mesh();
+	const surfaceVectorField& Sf = mesh.Sf();
+
+	const dimensionedScalar deltaN = ("deltaN", 1e-8/pow(average(alpha1.mesh().V()), 1.0/3.0) );
+	
+
+
+	// Cell gradient of alpha
+	volVectorField gradAlpha(fvc::grad(alpha1, "nHat"));
+	
+	vectorField gradAlphaTmp(gradAlpha);
+
+	for(label i=0; i<4; ++i)
+	{	
+		forAll( mesh.C(), celli)
+		{
+			//if (mag(gradAlpha[celli]) > 0.1 && mag(gradAlpha[celli] < 0.9 ) 
+		
+			if (alpha1[celli] > 0.001 && alpha1[celli] < 0.999 ) 
+			{
+				vector direction = gradAlpha[celli];
+				const List<label>& neighbours = mesh.cellCells()[celli];
+				forAll(neighbours, id)
+				{
+					direction +=  gradAlphaTmp[ neighbours[id] ];
+				}
+				gradAlpha[celli] = direction * ( mag(gradAlphaTmp[celli]) / ( mag(direction) + SMALL ) ) ;
+			}
+		}
+	}
+
+	// Interpolated face-gradient of alpha
+	surfaceVectorField gradAlphaf(fvc::interpolate(gradAlpha));
+
+	//gradAlphaf -=
+	//    (mesh.Sf()/mesh.magSf())
+	//   *(fvc::snGrad(alpha1_) - (mesh.Sf() & gradAlphaf)/mesh.magSf());
+
+	// Face unit interface normal
+	surfaceVectorField nHatfv(gradAlphaf/(mag(gradAlphaf) + deltaN));
+	// surfaceVectorField nHatfv
+	// (
+	//     (gradAlphaf + deltaN_*vector(0, 0, 1)
+	//    *sign(gradAlphaf.component(vector::Z)))/(mag(gradAlphaf) + deltaN_)
+	// );
+
+	//TODO uncomment and compy the correctContactAngle from interfaceProperties class
+	//correctContactAngle(nHatfv.boundaryField(), gradAlphaf.boundaryField());
+
+	// Face unit interface normal flux
+	surfaceScalarField nHatf
+	(
+		IOobject
+		(
+		    "nHatf",
+		    alpha1.time().timeName(),
+		    alpha1.mesh()
+		),
+		alpha1.mesh(),
+		dimensionedScalar("nHatf", dimArea, 0.0)
+	);
+
+	nHatf = nHatfv & Sf;
+
+
+	// Simple expression for curvature
+	volScalarField K
+	(
+		IOobject
+		(
+		    "curvatureK",
+		    alpha1.time().timeName(),
+		    alpha1.mesh()
+		),
+		alpha1.mesh(),
+		dimensionedScalar("K", dimless/dimLength, 0.0)
+	);
+
+	K = -fvc::div(nHatf);
+
+
+	// Complex expression for curvature.
+	// Correction is formally zero but numerically non-zero.
+	/*
+	volVectorField nHat(gradAlpha/(mag(gradAlpha) + deltaN_));
+	forAll(nHat.boundaryField(), patchi)
+	{
+	nHat.boundaryField()[patchi] = nHatfv.boundaryField()[patchi];
+	}
+	K_ = -fvc::div(nHatf_) + (nHat & fvc::grad(nHatfv) & nHat);
+	*/
+	return  fvc::interpolate(mixture.sigma()*K)*fvc::snGrad(alpha1);
+}
+
+
+
+int main(int argc, char *argv[])
+{
+    #include "setRootCase.H"
+    #include "createTime.H"
+    #include "createMesh.H"
+
+    pimpleControl pimple(mesh);
+
+    #include "initContinuityErrs.H"
+    #include "createFields.H"
+    #include "readTimeControls.H"
+    #include "createPrghCorrTypes.H"
+    #include "correctPhi.H"
+    #include "CourantNo.H"
+    #include "setInitialDeltaT.H"
+
+    // * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+
+
+    Info<< "\nStarting time loop\n" << endl;
+
+	Info<< "Time = " << runTime.timeName() << nl << endl;
+
+	for(label i=0; i<smoothIterPre; ++i)
+	{
+		Info<< "Initial alpha field smoothing "<< i << endl;
+		surfaceScalarField alphaSmothing("smothing", fvc::interpolate(alpha1) * mesh.magSf());
+
+		alpha1.internalField() = 0;
+		forAll(owner, faceId)
+		{
+			alpha1[owner[faceId]] += alphaSmothing[faceId] / cellTotalSurface[owner[faceId]];
+			alpha1[neighbour[faceId]] += alphaSmothing[faceId] / cellTotalSurface[neighbour[faceId]];
+		}
+
+		forAll(mesh.boundary(), patchi)
+		{
+		    const unallocLabelList& faceCells = mesh.boundary()[patchi].faceCells();
+		    const fvPatch & patch = mesh.boundary()[patchi];
+
+		    forAll(alphaSmothing.boundaryField()[patchi], patchFacei)
+		    {
+			label cellId = faceCells[patchFacei];
+			alpha1[cellId] += alphaSmothing.boundaryField()[patchi][patchFacei] / cellTotalSurface[cellId];
+		    }
+		}
+		alpha2 = 1. - alpha1;
+		mixture.correct();
+	}
+
+		
+
+    while (runTime.run())
+    {
+        #include "readTimeControls.H"
+        #include "CourantNo.H"
+        #include "alphaCourantNo.H"
+        #include "setDeltaT.H"
+
+        runTime++;
+        // --- Pressure-velocity PIMPLE corrector loop
+        while (pimple.loop())
+        {
+            #include "alphaControls.H"
+            //waring: alpha1 is replaced with smoothed version of alpha
+            #include "alphaEqnSubCycle.H"
+            mixture.correct();
+	    surfaceScalarField tensionForce( calculateSurfaceTensionForce(alpha1, mixture));
+            #include "UEqn.H"
+            // --- Pressure corrector loop
+            while (pimple.correct())
+            {	
+                #include "pEqn.H"
+            }
+
+            if (pimple.turbCorr())
+            {	
+                turbulence->correct();
+            }
+	    //come back from smoothed to non-smoothed alphas	
+	    alpha1.internalField() = alpha1_tmp.internalField();
+            alpha2 = 1. - alpha1;
+	    rho == alpha1*rho1 + alpha2*rho2;
+	    mixture.correct();
+	
+ //- Correct the transport and interface properties immiscibleIncompressibleTwoPhaseMixture() de fakto liczy  calculateK(); z class interfaceProperties
+
+        }
+ Info<< "Time = " << runTime.timeName() << nl << endl;
+	K = mixture.K();
+	//mixture.K().wirte();
+        runTime.write();
+
+        Info<< "ExecutionTime = " << runTime.elapsedCpuTime() << " s"
+            << "  ClockTime = " << runTime.elapsedClockTime() << " s"
+            << nl << endl;
+    }
+
+    Info<< "End\n" << endl;
+
+    return 0;
+}
+
+
+// ************************************************************************* //
